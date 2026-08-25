@@ -5,15 +5,15 @@
 
 // ============================================================
 // ESP32 + OLED SH1106 128x64 + EC11 + 4 relay
-// Полностью неблокирующая логика: НЕТ delay().
-// Все таймеры работают через millis().
+// Полностью неблокирующая логика: без delay().
+// Энкодер обрабатывается прерываниями, поэтому OLED/I2C не теряет шаги.
 // ============================================================
 
 // OLED
 static constexpr uint8_t PIN_SDA = 21;
 static constexpr uint8_t PIN_SCL = 22;
 
-// Энкодер / кнопки панели
+// Панель
 static constexpr uint8_t PIN_ENC_A    = 32; // TRA
 static constexpr uint8_t PIN_ENC_B    = 33; // TRB
 static constexpr uint8_t PIN_ENC_PUSH = 25; // PSH
@@ -29,27 +29,23 @@ static constexpr uint8_t PIN_RELAY_M2_LEFT  = 19;
 static constexpr bool RELAY_ACTIVE_LOW = true;
 static constexpr uint32_t DIRECTION_DEAD_TIME_MS = 800;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 35;
-static constexpr uint32_t DISPLAY_UPDATE_MS = 150;
+static constexpr uint32_t DISPLAY_UPDATE_MS = 200;
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 Preferences preferences;
 
 // ============================================================
-// СОХРАНЯЕМЫЕ НАСТРОЙКИ
+// НАСТРОЙКИ
 // ============================================================
-uint8_t rightMinutes = 1;     // 1..3
-uint8_t leftMinutes = 2;      // 1..3
-uint16_t totalMinutes = 30;   // 1..120
+uint8_t rightMinutes = 1;      // 1..3
+uint8_t leftMinutes = 2;       // 1..3
+uint16_t totalMinutes = 30;    // 1..120
 
 void loadSettings() {
     preferences.begin("dvigprikatka", false);
-    rightMinutes = preferences.getUChar("right", 1);
-    leftMinutes = preferences.getUChar("left", 2);
-    totalMinutes = preferences.getUShort("total", 30);
-
-    rightMinutes = constrain(rightMinutes, 1, 3);
-    leftMinutes = constrain(leftMinutes, 1, 3);
-    totalMinutes = constrain(totalMinutes, 1, 120);
+    rightMinutes = constrain(preferences.getUChar("right", 1), 1, 3);
+    leftMinutes = constrain(preferences.getUChar("left", 2), 1, 3);
+    totalMinutes = constrain(preferences.getUShort("total", 30), 1, 120);
 }
 
 void saveSettings() {
@@ -75,8 +71,7 @@ void allRelaysOff() {
 }
 
 // ============================================================
-// АСИНХРОННЫЙ АВТОМАТ ОДНОГО ДВИГАТЕЛЯ
-// Каждый двигатель имеет собственный таймер и состояние.
+// ДВИГАТЕЛЬ: НЕЗАВИСИМЫЙ АВТОМАТ
 // ============================================================
 enum class MotorPhase : uint8_t {
     STOPPED,
@@ -110,9 +105,8 @@ struct MotorController {
 
     void start(uint32_t now) {
         cycles = 0;
-        relaysOff();
-        phase = MotorPhase::RIGHT;
         phaseStartedAt = now;
+        phase = MotorPhase::RIGHT;
         setRight();
     }
 
@@ -158,13 +152,12 @@ struct MotorController {
                 }
                 break;
 
-            case MotorPhase::STOPPED:
             default:
                 break;
         }
     }
 
-    uint32_t phaseRemaining(uint32_t now) const {
+    uint32_t remaining(uint32_t now) const {
         uint32_t duration = 0;
         switch (phase) {
             case MotorPhase::RIGHT:
@@ -180,12 +173,11 @@ struct MotorController {
             default:
                 return 0;
         }
-
         const uint32_t elapsed = now - phaseStartedAt;
         return elapsed >= duration ? 0 : duration - elapsed;
     }
 
-    const char *phaseName() const {
+    const char *name() const {
         switch (phase) {
             case MotorPhase::RIGHT: return "RIGHT";
             case MotorPhase::LEFT: return "LEFT";
@@ -200,7 +192,7 @@ MotorController motor1{PIN_RELAY_M1_RIGHT, PIN_RELAY_M1_LEFT};
 MotorController motor2{PIN_RELAY_M2_RIGHT, PIN_RELAY_M2_LEFT};
 
 // ============================================================
-// СОСТОЯНИЕ ПРОГРАММЫ
+// UI
 // ============================================================
 enum class UiState : uint8_t {
     MENU,
@@ -216,92 +208,12 @@ uint8_t menuIndex = 0;
 uint32_t runStartedAt = 0;
 uint32_t lastDisplayAt = 0;
 
-// ============================================================
-// АСИНХРОННАЯ ОБРАБОТКА КНОПОК
-// ============================================================
-struct AsyncButton {
-    uint8_t pin;
-    bool rawState = HIGH;
-    bool stableState = HIGH;
-    uint32_t rawChangedAt = 0;
-    bool pressEvent = false;
-
-    void begin() {
-        pinMode(pin, INPUT_PULLUP);
-        rawState = digitalRead(pin);
-        stableState = rawState;
-        rawChangedAt = millis();
-    }
-
-    void update(uint32_t now) {
-        const bool raw = digitalRead(pin);
-
-        if (raw != rawState) {
-            rawState = raw;
-            rawChangedAt = now;
-        }
-
-        if (raw != stableState && (now - rawChangedAt) >= BUTTON_DEBOUNCE_MS) {
-            stableState = raw;
-            if (stableState == LOW) {
-                pressEvent = true;
-            }
-        }
-    }
-
-    bool pressed() {
-        if (!pressEvent) return false;
-        pressEvent = false;
-        return true;
-    }
-};
-
-AsyncButton btnEncoder{PIN_ENC_PUSH};
-AsyncButton btnBack{PIN_BACK};
-AsyncButton btnConfirm{PIN_CONFIRM};
-
-// ============================================================
-// ЭНКОДЕР - НЕБЛОКИРУЮЩИЙ ОПРОС
-// ============================================================
-uint8_t lastEncoderState = 0;
-int8_t encoderAccumulator = 0;
-
-int8_t pollEncoder() {
-    static const int8_t table[16] = {
-         0, -1,  1,  0,
-         1,  0,  0, -1,
-        -1,  0,  0,  1,
-         0,  1, -1,  0
-    };
-
-    const uint8_t a = digitalRead(PIN_ENC_A) ? 1 : 0;
-    const uint8_t b = digitalRead(PIN_ENC_B) ? 1 : 0;
-    const uint8_t current = (a << 1) | b;
-
-    encoderAccumulator += table[(lastEncoderState << 2) | current];
-    lastEncoderState = current;
-
-    if (encoderAccumulator >= 4) {
-        encoderAccumulator = 0;
-        return 1;
-    }
-    if (encoderAccumulator <= -4) {
-        encoderAccumulator = 0;
-        return -1;
-    }
-    return 0;
-}
-
-// ============================================================
-// ЭКРАН
-// ============================================================
 String mmss(uint32_t ms) {
     const uint32_t sec = ms / 1000UL;
-    const uint32_t min = sec / 60UL;
-    const uint32_t rem = sec % 60UL;
     char buf[16];
     snprintf(buf, sizeof(buf), "%02lu:%02lu",
-             (unsigned long)min, (unsigned long)rem);
+             (unsigned long)(sec / 60UL),
+             (unsigned long)(sec % 60UL));
     return String(buf);
 }
 
@@ -329,15 +241,13 @@ void drawMenu() {
         }
 
         text(3, y, String(i == menuIndex ? "> " : "  ") + labels[i]);
-
         if (i < 3) {
-            const int16_t w = display.getUTF8Width(values[i].c_str());
+            int16_t w = display.getUTF8Width(values[i].c_str());
             text(125 - w, y, values[i]);
         }
 
         if (i == menuIndex) display.setDrawColor(1);
     }
-
     display.sendBuffer();
 }
 
@@ -347,9 +257,9 @@ void drawEdit(const char *title, uint16_t value, uint16_t maxValue) {
     text(0, 12, String("SET ") + title);
 
     display.setFont(u8g2_font_logisoso24_tf);
-    const String valueText = String(value);
-    const int16_t w = display.getUTF8Width(valueText.c_str());
-    text((128 - w) / 2, 43, valueText);
+    String v = String(value);
+    int16_t w = display.getUTF8Width(v.c_str());
+    text((128 - w) / 2, 43, v);
 
     display.setFont(u8g2_font_6x12_tf);
     text(0, 62, String("1-") + maxValue + " min PUSH=OK");
@@ -359,24 +269,22 @@ void drawEdit(const char *title, uint16_t value, uint16_t maxValue) {
 void drawRunning(uint32_t now) {
     const uint32_t totalDuration = (uint32_t)totalMinutes * 60000UL;
     const uint32_t elapsed = now - runStartedAt;
-    const uint32_t remain = elapsed >= totalDuration ? 0 : totalDuration - elapsed;
+    const uint32_t totalRemain = elapsed >= totalDuration ? 0 : totalDuration - elapsed;
 
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
-
-    text(0, 11, String("TOTAL ") + mmss(remain));
-    text(0, 25, String("M1 ") + motor1.phaseName() + " C:" + motor1.cycles);
-    text(0, 39, String("   left ") + mmss(motor1.phaseRemaining(now)));
-    text(0, 53, String("M2 ") + motor2.phaseName() + " C:" + motor2.cycles);
-    text(0, 64, "PUSH/BACK = STOP");
-
+    text(0, 11, String("TOTAL ") + mmss(totalRemain));
+    text(0, 25, String("M1 ") + motor1.name() + " C:" + motor1.cycles);
+    text(0, 39, String("M1 LEFT ") + mmss(motor1.remaining(now)));
+    text(0, 53, String("M2 ") + motor2.name() + " C:" + motor2.cycles);
+    text(0, 64, "PUSH/BACK=STOP");
     display.sendBuffer();
 }
 
 void drawFinished() {
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
-    text(19, 14, "WORK FINISHED");
+    text(18, 14, "WORK FINISHED");
     text(5, 31, String("M1 cycles: ") + motor1.cycles);
     text(5, 45, String("M2 cycles: ") + motor2.cycles);
     text(1, 62, "PUSH=MENU CON=START");
@@ -384,20 +292,103 @@ void drawFinished() {
 }
 
 // ============================================================
-// ЗАПУСК / ОСТАНОВ
+// КНОПКИ
+// ============================================================
+struct AsyncButton {
+    uint8_t pin;
+    bool rawState = HIGH;
+    bool stableState = HIGH;
+    uint32_t changedAt = 0;
+    bool event = false;
+
+    void begin() {
+        pinMode(pin, INPUT_PULLUP);
+        rawState = digitalRead(pin);
+        stableState = rawState;
+        changedAt = millis();
+    }
+
+    void update(uint32_t now) {
+        const bool raw = digitalRead(pin);
+        if (raw != rawState) {
+            rawState = raw;
+            changedAt = now;
+        }
+        if (raw != stableState && (now - changedAt) >= BUTTON_DEBOUNCE_MS) {
+            stableState = raw;
+            if (stableState == LOW) event = true;
+        }
+    }
+
+    bool pressed() {
+        if (!event) return false;
+        event = false;
+        return true;
+    }
+};
+
+AsyncButton btnEncoder{PIN_ENC_PUSH};
+AsyncButton btnBack{PIN_BACK};
+AsyncButton btnConfirm{PIN_CONFIRM};
+
+// ============================================================
+// ЭНКОДЕР: ПРЕРЫВАНИЯ
+// ============================================================
+portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+volatile int16_t encoderQuarterSteps = 0;
+volatile uint8_t encoderPrevState = 0;
+
+void IRAM_ATTR encoderISR() {
+    static const int8_t transitionTable[16] = {
+         0, -1,  1,  0,
+         1,  0,  0, -1,
+        -1,  0,  0,  1,
+         0,  1, -1,  0
+    };
+
+    const uint8_t a = digitalRead(PIN_ENC_A) ? 1 : 0;
+    const uint8_t b = digitalRead(PIN_ENC_B) ? 1 : 0;
+    const uint8_t current = (a << 1) | b;
+    const int8_t delta = transitionTable[(encoderPrevState << 2) | current];
+    encoderPrevState = current;
+
+    if (delta != 0) {
+        portENTER_CRITICAL_ISR(&encoderMux);
+        encoderQuarterSteps += delta;
+        portEXIT_CRITICAL_ISR(&encoderMux);
+    }
+}
+
+int8_t getEncoderStep() {
+    int16_t q = 0;
+
+    portENTER_CRITICAL(&encoderMux);
+    q = encoderQuarterSteps;
+
+    int8_t step = 0;
+    // Большинство EC11 дают 4 квадратурных перехода на один фиксированный щелчок.
+    if (q >= 4) {
+        encoderQuarterSteps -= 4;
+        step = 1;
+    } else if (q <= -4) {
+        encoderQuarterSteps += 4;
+        step = -1;
+    }
+    portEXIT_CRITICAL(&encoderMux);
+
+    return step;
+}
+
+// ============================================================
+// RUN
 // ============================================================
 void startRun() {
     saveSettings();
-
     const uint32_t now = millis();
     runStartedAt = now;
     lastDisplayAt = 0;
-
-    // Оба двигателя имеют независимые автоматы состояний.
-    // Они запускаются одновременно, но дальше обслуживаются независимо.
     motor1.start(now);
     motor2.start(now);
-
     uiState = UiState::RUNNING;
     drawRunning(now);
 }
@@ -416,15 +407,10 @@ void stopRun(bool finished) {
     }
 }
 
-// ============================================================
-// НЕБЛОКИРУЮЩЕЕ ОБСЛУЖИВАНИЕ РАБОТЫ
-// ============================================================
 void updateRun(uint32_t now) {
     if (uiState != UiState::RUNNING) return;
 
     const uint32_t totalDuration = (uint32_t)totalMinutes * 60000UL;
-
-    // Общий таймер имеет наивысший приоритет.
     if ((now - runStartedAt) >= totalDuration) {
         stopRun(true);
         return;
@@ -470,8 +456,7 @@ void handleEncoderTurn(int8_t step) {
             drawEdit("TOTAL", totalMinutes, 120);
             break;
 
-        case UiState::RUNNING:
-        case UiState::FINISHED:
+        default:
             break;
     }
 }
@@ -479,22 +464,17 @@ void handleEncoderTurn(int8_t step) {
 void handleEncoderPush() {
     switch (uiState) {
         case UiState::MENU:
-            switch (menuIndex) {
-                case 0:
-                    uiState = UiState::EDIT_RIGHT;
-                    drawEdit("RIGHT", rightMinutes, 3);
-                    break;
-                case 1:
-                    uiState = UiState::EDIT_LEFT;
-                    drawEdit("LEFT", leftMinutes, 3);
-                    break;
-                case 2:
-                    uiState = UiState::EDIT_TOTAL;
-                    drawEdit("TOTAL", totalMinutes, 120);
-                    break;
-                case 3:
-                    startRun();
-                    break;
+            if (menuIndex == 0) {
+                uiState = UiState::EDIT_RIGHT;
+                drawEdit("RIGHT", rightMinutes, 3);
+            } else if (menuIndex == 1) {
+                uiState = UiState::EDIT_LEFT;
+                drawEdit("LEFT", leftMinutes, 3);
+            } else if (menuIndex == 2) {
+                uiState = UiState::EDIT_TOTAL;
+                drawEdit("TOTAL", totalMinutes, 120);
+            } else {
+                startRun();
             }
             break;
 
@@ -518,7 +498,7 @@ void handleEncoderPush() {
 }
 
 // ============================================================
-// SETUP
+// SETUP / LOOP
 // ============================================================
 void setup() {
     Serial.begin(115200);
@@ -535,11 +515,14 @@ void setup() {
     btnBack.begin();
     btnConfirm.begin();
 
-    const uint8_t a = digitalRead(PIN_ENC_A) ? 1 : 0;
-    const uint8_t b = digitalRead(PIN_ENC_B) ? 1 : 0;
-    lastEncoderState = (a << 1) | b;
+    encoderPrevState = ((digitalRead(PIN_ENC_A) ? 1 : 0) << 1) |
+                       (digitalRead(PIN_ENC_B) ? 1 : 0);
+
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encoderISR, CHANGE);
 
     Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setClock(400000);
     display.begin();
     display.setContrast(255);
 
@@ -547,39 +530,31 @@ void setup() {
     drawMenu();
 }
 
-// ============================================================
-// LOOP: НИКАКИХ delay(), ВСЕ ЗАДАЧИ ВЫПОЛНЯЮТСЯ ПАРАЛЛЕЛЬНО
-// ============================================================
 void loop() {
     const uint32_t now = millis();
 
-    // 1. Энкодер постоянно опрашивается независимо от работы двигателей.
-    handleEncoderTurn(pollEncoder());
+    // Забираем все накопившиеся шаги энкодера.
+    for (uint8_t i = 0; i < 8; i++) {
+        const int8_t step = getEncoderStep();
+        if (step == 0) break;
+        handleEncoderTurn(step);
+    }
 
-    // 2. Все кнопки обновляются независимо.
     btnEncoder.update(now);
     btnBack.update(now);
     btnConfirm.update(now);
 
-    // 3. Встроенная кнопка энкодера управляет меню / START / STOP.
     if (btnEncoder.pressed()) {
         handleEncoderPush();
     }
 
-    // 4. BACK всегда является быстрым STOP во время работы.
-    if (btnBack.pressed()) {
-        if (uiState == UiState::RUNNING) {
-            stopRun(false);
-        }
+    if (btnBack.pressed() && uiState == UiState::RUNNING) {
+        stopRun(false);
     }
 
-    // 5. CONFIRM дублирует START.
-    if (btnConfirm.pressed()) {
-        if (uiState != UiState::RUNNING) {
-            startRun();
-        }
+    if (btnConfirm.pressed() && uiState != UiState::RUNNING) {
+        startRun();
     }
 
-    // 6. Оба двигателя и общий таймер обновляются независимо.
     updateRun(now);
 }
