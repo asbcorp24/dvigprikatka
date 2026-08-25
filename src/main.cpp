@@ -2,27 +2,29 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <Preferences.h>
+#include <ESP32Encoder.h>
 
 static constexpr uint8_t PIN_SDA = 21;
 static constexpr uint8_t PIN_SCL = 22;
-static constexpr uint8_t PIN_ENC_A = 32;
-static constexpr uint8_t PIN_ENC_B = 33;
-static constexpr uint8_t PIN_ENC_PUSH = 25;
-static constexpr uint8_t PIN_BACK = 26;
-static constexpr uint8_t PIN_CONFIRM = 27;
+static constexpr uint8_t PIN_ENC_A = 32;   // TRA
+static constexpr uint8_t PIN_ENC_B = 33;   // TRB
+static constexpr uint8_t PIN_ENC_PUSH = 25; // PSH
+static constexpr uint8_t PIN_BACK = 26;     // BAK = STOP
+static constexpr uint8_t PIN_CONFIRM = 27;  // CON = START
+
 static constexpr uint8_t PIN_RELAY_M1_RIGHT = 16;
-static constexpr uint8_t PIN_RELAY_M1_LEFT = 17;
+static constexpr uint8_t PIN_RELAY_M1_LEFT  = 17;
 static constexpr uint8_t PIN_RELAY_M2_RIGHT = 18;
-static constexpr uint8_t PIN_RELAY_M2_LEFT = 19;
+static constexpr uint8_t PIN_RELAY_M2_LEFT  = 19;
 
 static constexpr bool RELAY_ACTIVE_LOW = true;
 static constexpr uint32_t DIRECTION_DEAD_TIME_MS = 800;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 35;
 static constexpr uint32_t DISPLAY_UPDATE_MS = 150;
-static constexpr uint32_t ENCODER_DEBOUNCE_US = 1800;
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 Preferences preferences;
+ESP32Encoder encoder;
 
 uint8_t rightMinutes = 1;
 uint8_t leftMinutes = 2;
@@ -54,7 +56,13 @@ void allRelaysOff() {
     writeRelay(PIN_RELAY_M2_LEFT, false);
 }
 
-enum class MotorPhase : uint8_t { STOPPED, RIGHT, PAUSE_TO_LEFT, LEFT, PAUSE_TO_RIGHT };
+enum class MotorPhase : uint8_t {
+    STOPPED,
+    RIGHT,
+    PAUSE_TO_LEFT,
+    LEFT,
+    PAUSE_TO_RIGHT
+};
 
 struct MotorController {
     uint8_t rightPin;
@@ -63,56 +71,92 @@ struct MotorController {
     uint32_t phaseStartedAt = 0;
     uint32_t cycles = 0;
 
-    void off() { writeRelay(rightPin, false); writeRelay(leftPin, false); }
-    void setRight() { off(); writeRelay(rightPin, true); }
-    void setLeft() { off(); writeRelay(leftPin, true); }
+    void off() {
+        writeRelay(rightPin, false);
+        writeRelay(leftPin, false);
+    }
+
+    void setRight() {
+        off();
+        writeRelay(rightPin, true);
+    }
+
+    void setLeft() {
+        off();
+        writeRelay(leftPin, true);
+    }
 
     void start(uint32_t now) {
         cycles = 0;
-        off();
-        phase = MotorPhase::RIGHT;
         phaseStartedAt = now;
+        phase = MotorPhase::RIGHT;
         setRight();
     }
 
-    void stop() { off(); phase = MotorPhase::STOPPED; }
+    void stop() {
+        off();
+        phase = MotorPhase::STOPPED;
+    }
 
     void update(uint32_t now) {
         const uint32_t elapsed = now - phaseStartedAt;
+
         switch (phase) {
             case MotorPhase::RIGHT:
                 if (elapsed >= (uint32_t)rightMinutes * 60000UL) {
-                    off(); phase = MotorPhase::PAUSE_TO_LEFT; phaseStartedAt = now;
+                    off();
+                    phase = MotorPhase::PAUSE_TO_LEFT;
+                    phaseStartedAt = now;
                 }
                 break;
+
             case MotorPhase::PAUSE_TO_LEFT:
                 if (elapsed >= DIRECTION_DEAD_TIME_MS) {
-                    setLeft(); phase = MotorPhase::LEFT; phaseStartedAt = now;
+                    setLeft();
+                    phase = MotorPhase::LEFT;
+                    phaseStartedAt = now;
                 }
                 break;
+
             case MotorPhase::LEFT:
                 if (elapsed >= (uint32_t)leftMinutes * 60000UL) {
-                    off(); cycles++; phase = MotorPhase::PAUSE_TO_RIGHT; phaseStartedAt = now;
+                    off();
+                    cycles++;
+                    phase = MotorPhase::PAUSE_TO_RIGHT;
+                    phaseStartedAt = now;
                 }
                 break;
+
             case MotorPhase::PAUSE_TO_RIGHT:
                 if (elapsed >= DIRECTION_DEAD_TIME_MS) {
-                    setRight(); phase = MotorPhase::RIGHT; phaseStartedAt = now;
+                    setRight();
+                    phase = MotorPhase::RIGHT;
+                    phaseStartedAt = now;
                 }
                 break;
-            default: break;
+
+            default:
+                break;
         }
     }
 
     uint32_t remaining(uint32_t now) const {
         uint32_t duration = 0;
         switch (phase) {
-            case MotorPhase::RIGHT: duration = (uint32_t)rightMinutes * 60000UL; break;
-            case MotorPhase::LEFT: duration = (uint32_t)leftMinutes * 60000UL; break;
+            case MotorPhase::RIGHT:
+                duration = (uint32_t)rightMinutes * 60000UL;
+                break;
+            case MotorPhase::LEFT:
+                duration = (uint32_t)leftMinutes * 60000UL;
+                break;
             case MotorPhase::PAUSE_TO_LEFT:
-            case MotorPhase::PAUSE_TO_RIGHT: duration = DIRECTION_DEAD_TIME_MS; break;
-            default: return 0;
+            case MotorPhase::PAUSE_TO_RIGHT:
+                duration = DIRECTION_DEAD_TIME_MS;
+                break;
+            default:
+                return 0;
         }
+
         const uint32_t elapsed = now - phaseStartedAt;
         return elapsed >= duration ? 0 : duration - elapsed;
     }
@@ -131,7 +175,15 @@ struct MotorController {
 MotorController motor1{PIN_RELAY_M1_RIGHT, PIN_RELAY_M1_LEFT};
 MotorController motor2{PIN_RELAY_M2_RIGHT, PIN_RELAY_M2_LEFT};
 
-enum class UiState : uint8_t { MENU, EDIT_RIGHT, EDIT_LEFT, EDIT_TOTAL, RUNNING, FINISHED };
+enum class UiState : uint8_t {
+    MENU,
+    EDIT_RIGHT,
+    EDIT_LEFT,
+    EDIT_TOTAL,
+    RUNNING,
+    FINISHED
+};
+
 UiState uiState = UiState::MENU;
 uint8_t menuIndex = 0;
 uint32_t runStartedAt = 0;
@@ -151,8 +203,12 @@ struct AsyncButton {
     }
 
     void update(uint32_t now) {
-        bool raw = digitalRead(pin);
-        if (raw != rawState) { rawState = raw; changedAt = now; }
+        const bool raw = digitalRead(pin);
+        if (raw != rawState) {
+            rawState = raw;
+            changedAt = now;
+        }
+
         if (raw != stableState && (now - changedAt) >= BUTTON_DEBOUNCE_MS) {
             stableState = raw;
             if (stableState == LOW) event = true;
@@ -170,64 +226,64 @@ AsyncButton btnEncoder{PIN_ENC_PUSH};
 AsyncButton btnBack{PIN_BACK};
 AsyncButton btnConfirm{PIN_CONFIRM};
 
-volatile int16_t encoderSteps = 0;
-volatile uint32_t encoderLastUs = 0;
-portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
-
-void IRAM_ATTR encoderISR() {
-    if (digitalRead(PIN_ENC_A) != LOW) return;
-    const uint32_t nowUs = micros();
-    if ((uint32_t)(nowUs - encoderLastUs) < ENCODER_DEBOUNCE_US) return;
-    encoderLastUs = nowUs;
-    const bool b = digitalRead(PIN_ENC_B);
-    portENTER_CRITICAL_ISR(&encoderMux);
-    encoderSteps += b ? 1 : -1;
-    portEXIT_CRITICAL_ISR(&encoderMux);
-}
-
-int8_t getEncoderStep() {
-    int8_t result = 0;
-    portENTER_CRITICAL(&encoderMux);
-    if (encoderSteps > 0) { encoderSteps--; result = 1; }
-    else if (encoderSteps < 0) { encoderSteps++; result = -1; }
-    portEXIT_CRITICAL(&encoderMux);
-    return result;
-}
-
 String mmss(uint32_t ms) {
     const uint32_t sec = ms / 1000UL;
     char buf[16];
-    snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)(sec / 60UL), (unsigned long)(sec % 60UL));
+    snprintf(buf, sizeof(buf), "%02lu:%02lu",
+             (unsigned long)(sec / 60UL),
+             (unsigned long)(sec % 60UL));
     return String(buf);
 }
 
-void text(uint8_t x, uint8_t y, const String &s) { display.drawUTF8(x, y, s.c_str()); }
+void text(uint8_t x, uint8_t y, const String &s) {
+    display.drawUTF8(x, y, s.c_str());
+}
 
 void drawMenu() {
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
+
     const char *labels[4] = {"RIGHT", "LEFT", "TOTAL", "START"};
-    String values[4] = { String(rightMinutes)+" min", String(leftMinutes)+" min", String(totalMinutes)+" min", "" };
-    for (uint8_t i=0; i<4; i++) {
-        uint8_t y = 13 + i*16;
-        if (i == menuIndex) { display.drawBox(0, y-11, 128, 14); display.setDrawColor(0); }
-        text(3, y, String(i==menuIndex ? "> " : "  ") + labels[i]);
-        if (i < 3) { int16_t w=display.getUTF8Width(values[i].c_str()); text(125-w, y, values[i]); }
+    String values[4] = {
+        String(rightMinutes) + " min",
+        String(leftMinutes) + " min",
+        String(totalMinutes) + " min",
+        ""
+    };
+
+    for (uint8_t i = 0; i < 4; i++) {
+        const uint8_t y = 13 + i * 16;
+
+        if (i == menuIndex) {
+            display.drawBox(0, y - 11, 128, 14);
+            display.setDrawColor(0);
+        }
+
+        text(3, y, String(i == menuIndex ? "> " : "  ") + labels[i]);
+
+        if (i < 3) {
+            const int16_t w = display.getUTF8Width(values[i].c_str());
+            text(125 - w, y, values[i]);
+        }
+
         if (i == menuIndex) display.setDrawColor(1);
     }
+
     display.sendBuffer();
 }
 
 void drawEdit(const char *title, uint16_t value, uint16_t maxValue) {
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
-    text(0,12,String("SET ")+title);
+    text(0, 12, String("SET ") + title);
+
     display.setFont(u8g2_font_logisoso24_tf);
-    String v=String(value);
-    int16_t w=display.getUTF8Width(v.c_str());
-    text((128-w)/2,43,v);
+    const String v = String(value);
+    const int16_t w = display.getUTF8Width(v.c_str());
+    text((128 - w) / 2, 43, v);
+
     display.setFont(u8g2_font_6x12_tf);
-    text(0,62,String("1-")+maxValue+" min PUSH=OK");
+    text(0, 62, String("1-") + maxValue + " min PUSH=OK");
     display.sendBuffer();
 }
 
@@ -238,31 +294,36 @@ void drawRunning(uint32_t now) {
 
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
+
     text(0, 12, String("TOTAL: ") + mmss(remain));
     text(0, 27, String("M1: ") + motor1.name() + " " + mmss(motor1.remaining(now)));
     text(0, 42, String("M2: ") + motor2.name() + " " + mmss(motor2.remaining(now)));
     text(0, 57, String("CYCLES: ") + motor1.cycles + " / " + motor2.cycles);
+
     display.sendBuffer();
 }
 
 void drawFinished() {
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
-    text(18,14,"WORK FINISHED");
-    text(5,31,String("M1 cycles: ")+motor1.cycles);
-    text(5,45,String("M2 cycles: ")+motor2.cycles);
-    text(1,62,"PUSH=MENU CON=START");
+    text(18, 14, "WORK FINISHED");
+    text(5, 31, String("M1 cycles: ") + motor1.cycles);
+    text(5, 45, String("M2 cycles: ") + motor2.cycles);
+    text(1, 62, "PUSH=MENU CON=START");
     display.sendBuffer();
 }
 
 void startRun() {
     saveSettings();
-    uint32_t now=millis();
-    runStartedAt=now;
-    lastDisplayAt=0;
+
+    const uint32_t now = millis();
+    runStartedAt = now;
+    lastDisplayAt = 0;
+
     motor1.start(now);
     motor2.start(now);
-    uiState=UiState::RUNNING;
+
+    uiState = UiState::RUNNING;
     drawRunning(now);
 }
 
@@ -270,86 +331,143 @@ void stopRun(bool finished) {
     motor1.stop();
     motor2.stop();
     allRelaysOff();
-    if (finished) { uiState=UiState::FINISHED; drawFinished(); }
-    else { uiState=UiState::MENU; drawMenu(); }
+
+    if (finished) {
+        uiState = UiState::FINISHED;
+        drawFinished();
+    } else {
+        uiState = UiState::MENU;
+        drawMenu();
+    }
 }
 
 void updateRun(uint32_t now) {
     if (uiState != UiState::RUNNING) return;
-    uint32_t totalDuration=(uint32_t)totalMinutes*60000UL;
-    if ((now-runStartedAt)>=totalDuration) { stopRun(true); return; }
+
+    const uint32_t totalDuration = (uint32_t)totalMinutes * 60000UL;
+
+    if ((now - runStartedAt) >= totalDuration) {
+        stopRun(true);
+        return;
+    }
+
     motor1.update(now);
     motor2.update(now);
-    if ((now-lastDisplayAt)>=DISPLAY_UPDATE_MS) { lastDisplayAt=now; drawRunning(now); }
+
+    if ((now - lastDisplayAt) >= DISPLAY_UPDATE_MS) {
+        lastDisplayAt = now;
+        drawRunning(now);
+    }
 }
 
 void handleEncoderTurn(int8_t step) {
-    if (!step) return;
-    Serial.printf("ENC step=%d A=%d B=%d\n", step, digitalRead(PIN_ENC_A), digitalRead(PIN_ENC_B));
+    if (step == 0) return;
+
+    Serial.printf("ENC step=%d raw=%lld\n", step, encoder.getCount());
+
     switch (uiState) {
         case UiState::MENU:
-            menuIndex = step > 0 ? (menuIndex+1)%4 : (menuIndex+3)%4;
+            if (step > 0) menuIndex = (menuIndex + 1) % 4;
+            else menuIndex = (menuIndex + 3) % 4;
             drawMenu();
             break;
+
         case UiState::EDIT_RIGHT:
-            if (step>0 && rightMinutes<3) rightMinutes++;
-            if (step<0 && rightMinutes>1) rightMinutes--;
-            drawEdit("RIGHT",rightMinutes,3);
+            if (step > 0 && rightMinutes < 3) rightMinutes++;
+            if (step < 0 && rightMinutes > 1) rightMinutes--;
+            drawEdit("RIGHT", rightMinutes, 3);
             break;
+
         case UiState::EDIT_LEFT:
-            if (step>0 && leftMinutes<3) leftMinutes++;
-            if (step<0 && leftMinutes>1) leftMinutes--;
-            drawEdit("LEFT",leftMinutes,3);
+            if (step > 0 && leftMinutes < 3) leftMinutes++;
+            if (step < 0 && leftMinutes > 1) leftMinutes--;
+            drawEdit("LEFT", leftMinutes, 3);
             break;
+
         case UiState::EDIT_TOTAL:
-            if (step>0 && totalMinutes<120) totalMinutes++;
-            if (step<0 && totalMinutes>1) totalMinutes--;
-            drawEdit("TOTAL",totalMinutes,120);
+            if (step > 0 && totalMinutes < 120) totalMinutes++;
+            if (step < 0 && totalMinutes > 1) totalMinutes--;
+            drawEdit("TOTAL", totalMinutes, 120);
             break;
-        default: break;
+
+        default:
+            break;
     }
 }
 
 void handleEncoderPush() {
     switch (uiState) {
         case UiState::MENU:
-            if (menuIndex==0) { uiState=UiState::EDIT_RIGHT; drawEdit("RIGHT",rightMinutes,3); }
-            else if (menuIndex==1) { uiState=UiState::EDIT_LEFT; drawEdit("LEFT",leftMinutes,3); }
-            else if (menuIndex==2) { uiState=UiState::EDIT_TOTAL; drawEdit("TOTAL",totalMinutes,120); }
-            else startRun();
+            if (menuIndex == 0) {
+                uiState = UiState::EDIT_RIGHT;
+                drawEdit("RIGHT", rightMinutes, 3);
+            } else if (menuIndex == 1) {
+                uiState = UiState::EDIT_LEFT;
+                drawEdit("LEFT", leftMinutes, 3);
+            } else if (menuIndex == 2) {
+                uiState = UiState::EDIT_TOTAL;
+                drawEdit("TOTAL", totalMinutes, 120);
+            } else {
+                startRun();
+            }
             break;
+
         case UiState::EDIT_RIGHT:
         case UiState::EDIT_LEFT:
         case UiState::EDIT_TOTAL:
             saveSettings();
-            uiState=UiState::MENU;
+            uiState = UiState::MENU;
             drawMenu();
             break;
+
         case UiState::RUNNING:
             stopRun(false);
             break;
+
         case UiState::FINISHED:
-            uiState=UiState::MENU;
+            uiState = UiState::MENU;
             drawMenu();
             break;
     }
 }
 
+// HalfQuad у EC11 обычно даёт 2 аппаратных отсчёта на один фиксированный щелчок.
+// Делим на 2 и работаем уже с логической позицией меню.
+int64_t lastEncoderPosition = 0;
+
+void updateEncoder() {
+    const int64_t raw = encoder.getCount();
+    const int64_t position = raw / 2;
+
+    while (lastEncoderPosition < position) {
+        lastEncoderPosition++;
+        handleEncoderTurn(+1);
+    }
+
+    while (lastEncoderPosition > position) {
+        lastEncoderPosition--;
+        handleEncoderTurn(-1);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
+
     pinMode(PIN_RELAY_M1_RIGHT, OUTPUT);
     pinMode(PIN_RELAY_M1_LEFT, OUTPUT);
     pinMode(PIN_RELAY_M2_RIGHT, OUTPUT);
     pinMode(PIN_RELAY_M2_LEFT, OUTPUT);
     allRelaysOff();
 
-    pinMode(PIN_ENC_A, INPUT_PULLUP);
-    pinMode(PIN_ENC_B, INPUT_PULLUP);
     btnEncoder.begin();
     btnBack.begin();
     btnConfirm.begin();
 
-    attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
+    // Аппаратный счётчик импульсов ESP32 (PCNT).
+    ESP32Encoder::useInternalWeakPullResistors = puType::up;
+    encoder.attachHalfQuad(PIN_ENC_A, PIN_ENC_B);
+    encoder.clearCount();
+    lastEncoderPosition = 0;
 
     Wire.begin(PIN_SDA, PIN_SCL);
     Wire.setClock(400000);
@@ -359,26 +477,30 @@ void setup() {
     loadSettings();
     drawMenu();
 
-    Serial.printf("Encoder init: TRA GPIO%u=%d TRB GPIO%u=%d PUSH GPIO%u=%d\n",
-                  PIN_ENC_A,digitalRead(PIN_ENC_A),PIN_ENC_B,digitalRead(PIN_ENC_B),PIN_ENC_PUSH,digitalRead(PIN_ENC_PUSH));
+    Serial.printf("ESP32Encoder started: TRA=%u TRB=%u PUSH=%u\n",
+                  PIN_ENC_A, PIN_ENC_B, PIN_ENC_PUSH);
 }
 
 void loop() {
-    uint32_t now=millis();
+    const uint32_t now = millis();
 
-    for (uint8_t i=0; i<8; i++) {
-        int8_t step=getEncoderStep();
-        if (!step) break;
-        handleEncoderTurn(step);
-    }
+    updateEncoder();
 
     btnEncoder.update(now);
     btnBack.update(now);
     btnConfirm.update(now);
 
-    if (btnEncoder.pressed()) handleEncoderPush();
-    if (btnBack.pressed() && uiState==UiState::RUNNING) stopRun(false);
-    if (btnConfirm.pressed() && uiState!=UiState::RUNNING) startRun();
+    if (btnEncoder.pressed()) {
+        handleEncoderPush();
+    }
+
+    if (btnBack.pressed() && uiState == UiState::RUNNING) {
+        stopRun(false);
+    }
+
+    if (btnConfirm.pressed() && uiState != UiState::RUNNING) {
+        startRun();
+    }
 
     updateRun(now);
 }
