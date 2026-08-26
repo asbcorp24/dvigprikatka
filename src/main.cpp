@@ -6,40 +6,85 @@
 
 static constexpr uint8_t PIN_SDA = 21;
 static constexpr uint8_t PIN_SCL = 22;
-static constexpr uint8_t PIN_ENC_A = 32;   // TRA
-static constexpr uint8_t PIN_ENC_B = 33;   // TRB
-static constexpr uint8_t PIN_ENC_PUSH = 25; // PSH
-static constexpr uint8_t PIN_BACK = 26;     // BAK = STOP
-static constexpr uint8_t PIN_CONFIRM = 27;  // CON = START
-
+static constexpr uint8_t PIN_ENC_A = 32;
+static constexpr uint8_t PIN_ENC_B = 33;
+static constexpr uint8_t PIN_ENC_PUSH = 25;
+static constexpr uint8_t PIN_BACK = 26;
+static constexpr uint8_t PIN_CONFIRM = 27;
 static constexpr uint8_t PIN_RELAY_M1_RIGHT = 16;
-static constexpr uint8_t PIN_RELAY_M1_LEFT  = 17;
+static constexpr uint8_t PIN_RELAY_M1_LEFT = 17;
 static constexpr uint8_t PIN_RELAY_M2_RIGHT = 18;
-static constexpr uint8_t PIN_RELAY_M2_LEFT  = 19;
+static constexpr uint8_t PIN_RELAY_M2_LEFT = 19;
 
 static constexpr bool RELAY_ACTIVE_LOW = true;
 static constexpr uint32_t DIRECTION_DEAD_TIME_MS = 800;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 35;
 static constexpr uint32_t DISPLAY_UPDATE_MS = 150;
 
+static constexpr uint16_t MIN_DIRECTION_MINUTES = 1;
+static constexpr uint16_t MAX_TOTAL_MINUTES = 120;
+
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 Preferences preferences;
 ESP32Encoder encoder;
 
-uint8_t rightMinutes = 1;
-uint8_t leftMinutes = 2;
+uint16_t rightMinutes = 1;
+uint16_t leftMinutes = 2;
 uint16_t totalMinutes = 30;
+
+uint16_t cycleMinutes() {
+    return rightMinutes + leftMinutes;
+}
+
+uint16_t maxRightMinutes() {
+    return MAX_TOTAL_MINUTES - leftMinutes;
+}
+
+uint16_t maxLeftMinutes() {
+    return MAX_TOTAL_MINUTES - rightMinutes;
+}
+
+void ensureTotalAtLeastCycle() {
+    const uint16_t minTotal = cycleMinutes();
+    if (totalMinutes < minTotal) totalMinutes = minTotal;
+    if (totalMinutes > MAX_TOTAL_MINUTES) totalMinutes = MAX_TOTAL_MINUTES;
+}
+
+void normalizeSettings() {
+    if (rightMinutes < MIN_DIRECTION_MINUTES) rightMinutes = MIN_DIRECTION_MINUTES;
+    if (leftMinutes < MIN_DIRECTION_MINUTES) leftMinutes = MIN_DIRECTION_MINUTES;
+
+    if (rightMinutes >= MAX_TOTAL_MINUTES) {
+        rightMinutes = MAX_TOTAL_MINUTES - MIN_DIRECTION_MINUTES;
+    }
+    if (leftMinutes >= MAX_TOTAL_MINUTES) {
+        leftMinutes = MAX_TOTAL_MINUTES - MIN_DIRECTION_MINUTES;
+    }
+
+    if (cycleMinutes() > MAX_TOTAL_MINUTES) {
+        leftMinutes = MAX_TOTAL_MINUTES - rightMinutes;
+        if (leftMinutes < MIN_DIRECTION_MINUTES) {
+            leftMinutes = MIN_DIRECTION_MINUTES;
+            rightMinutes = MAX_TOTAL_MINUTES - MIN_DIRECTION_MINUTES;
+        }
+    }
+
+    if (totalMinutes > MAX_TOTAL_MINUTES) totalMinutes = MAX_TOTAL_MINUTES;
+    ensureTotalAtLeastCycle();
+}
 
 void loadSettings() {
     preferences.begin("dvigprikatka", false);
-    rightMinutes = constrain(preferences.getUChar("right", 1), 1, 3);
-    leftMinutes = constrain(preferences.getUChar("left", 2), 1, 3);
-    totalMinutes = constrain(preferences.getUShort("total", 30), 1, 120);
+    rightMinutes = preferences.getUShort("right", 1);
+    leftMinutes = preferences.getUShort("left", 2);
+    totalMinutes = preferences.getUShort("total", 30);
+    normalizeSettings();
 }
 
 void saveSettings() {
-    preferences.putUChar("right", rightMinutes);
-    preferences.putUChar("left", leftMinutes);
+    normalizeSettings();
+    preferences.putUShort("right", rightMinutes);
+    preferences.putUShort("left", leftMinutes);
     preferences.putUShort("total", totalMinutes);
 }
 
@@ -103,7 +148,7 @@ struct MotorController {
 
         switch (phase) {
             case MotorPhase::RIGHT:
-                if (elapsed >= (uint32_t)rightMinutes * 60000UL) {
+                if (elapsed >= static_cast<uint32_t>(rightMinutes) * 60000UL) {
                     off();
                     phase = MotorPhase::PAUSE_TO_LEFT;
                     phaseStartedAt = now;
@@ -119,7 +164,7 @@ struct MotorController {
                 break;
 
             case MotorPhase::LEFT:
-                if (elapsed >= (uint32_t)leftMinutes * 60000UL) {
+                if (elapsed >= static_cast<uint32_t>(leftMinutes) * 60000UL) {
                     off();
                     cycles++;
                     phase = MotorPhase::PAUSE_TO_RIGHT;
@@ -142,12 +187,13 @@ struct MotorController {
 
     uint32_t remaining(uint32_t now) const {
         uint32_t duration = 0;
+
         switch (phase) {
             case MotorPhase::RIGHT:
-                duration = (uint32_t)rightMinutes * 60000UL;
+                duration = static_cast<uint32_t>(rightMinutes) * 60000UL;
                 break;
             case MotorPhase::LEFT:
-                duration = (uint32_t)leftMinutes * 60000UL;
+                duration = static_cast<uint32_t>(leftMinutes) * 60000UL;
                 break;
             case MotorPhase::PAUSE_TO_LEFT:
             case MotorPhase::PAUSE_TO_RIGHT:
@@ -208,7 +254,6 @@ struct AsyncButton {
             rawState = raw;
             changedAt = now;
         }
-
         if (raw != stableState && (now - changedAt) >= BUTTON_DEBOUNCE_MS) {
             stableState = raw;
             if (stableState == LOW) event = true;
@@ -230,8 +275,8 @@ String mmss(uint32_t ms) {
     const uint32_t sec = ms / 1000UL;
     char buf[16];
     snprintf(buf, sizeof(buf), "%02lu:%02lu",
-             (unsigned long)(sec / 60UL),
-             (unsigned long)(sec % 60UL));
+             static_cast<unsigned long>(sec / 60UL),
+             static_cast<unsigned long>(sec % 60UL));
     return String(buf);
 }
 
@@ -253,7 +298,6 @@ void drawMenu() {
 
     for (uint8_t i = 0; i < 4; i++) {
         const uint8_t y = 13 + i * 16;
-
         if (i == menuIndex) {
             display.drawBox(0, y - 11, 128, 14);
             display.setDrawColor(0);
@@ -272,7 +316,7 @@ void drawMenu() {
     display.sendBuffer();
 }
 
-void drawEdit(const char *title, uint16_t value, uint16_t maxValue) {
+void drawEdit(const char *title, uint16_t value, uint16_t minValue, uint16_t maxValue) {
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
     text(0, 12, String("SET ") + title);
@@ -283,23 +327,21 @@ void drawEdit(const char *title, uint16_t value, uint16_t maxValue) {
     text((128 - w) / 2, 43, v);
 
     display.setFont(u8g2_font_6x12_tf);
-    text(0, 62, String("1-") + maxValue + " min PUSH=OK");
+    text(0, 62, String(minValue) + "-" + String(maxValue) + " min PUSH=OK");
     display.sendBuffer();
 }
 
 void drawRunning(uint32_t now) {
-    const uint32_t totalDuration = (uint32_t)totalMinutes * 60000UL;
+    const uint32_t totalDuration = static_cast<uint32_t>(totalMinutes) * 60000UL;
     const uint32_t elapsed = now - runStartedAt;
     const uint32_t remain = elapsed >= totalDuration ? 0 : totalDuration - elapsed;
 
     display.clearBuffer();
     display.setFont(u8g2_font_6x12_tf);
-
     text(0, 12, String("TOTAL: ") + mmss(remain));
     text(0, 27, String("M1: ") + motor1.name() + " " + mmss(motor1.remaining(now)));
     text(0, 42, String("M2: ") + motor2.name() + " " + mmss(motor2.remaining(now)));
     text(0, 57, String("CYCLES: ") + motor1.cycles + " / " + motor2.cycles);
-
     display.sendBuffer();
 }
 
@@ -314,6 +356,7 @@ void drawFinished() {
 }
 
 void startRun() {
+    normalizeSettings();
     saveSettings();
 
     const uint32_t now = millis();
@@ -322,7 +365,6 @@ void startRun() {
 
     motor1.start(now);
     motor2.start(now);
-
     uiState = UiState::RUNNING;
     drawRunning(now);
 }
@@ -344,8 +386,7 @@ void stopRun(bool finished) {
 void updateRun(uint32_t now) {
     if (uiState != UiState::RUNNING) return;
 
-    const uint32_t totalDuration = (uint32_t)totalMinutes * 60000UL;
-
+    const uint32_t totalDuration = static_cast<uint32_t>(totalMinutes) * 60000UL;
     if ((now - runStartedAt) >= totalDuration) {
         stopRun(true);
         return;
@@ -363,32 +404,43 @@ void updateRun(uint32_t now) {
 void handleEncoderTurn(int8_t step) {
     if (step == 0) return;
 
-    Serial.printf("ENC step=%d raw=%lld\n", step, encoder.getCount());
+    Serial.printf("ENC step=%d raw=%lld\n", step, static_cast<long long>(encoder.getCount()));
 
     switch (uiState) {
         case UiState::MENU:
-            if (step > 0) menuIndex = (menuIndex + 1) % 4;
-            else menuIndex = (menuIndex + 3) % 4;
+            menuIndex = step > 0 ? (menuIndex + 1) % 4 : (menuIndex + 3) % 4;
             drawMenu();
             break;
 
         case UiState::EDIT_RIGHT:
-            if (step > 0 && rightMinutes < 3) rightMinutes++;
-            if (step < 0 && rightMinutes > 1) rightMinutes--;
-            drawEdit("RIGHT", rightMinutes, 3);
+            if (step > 0 && rightMinutes < maxRightMinutes()) {
+                rightMinutes++;
+                ensureTotalAtLeastCycle();
+            }
+            if (step < 0 && rightMinutes > MIN_DIRECTION_MINUTES) {
+                rightMinutes--;
+            }
+            drawEdit("RIGHT", rightMinutes, MIN_DIRECTION_MINUTES, maxRightMinutes());
             break;
 
         case UiState::EDIT_LEFT:
-            if (step > 0 && leftMinutes < 3) leftMinutes++;
-            if (step < 0 && leftMinutes > 1) leftMinutes--;
-            drawEdit("LEFT", leftMinutes, 3);
+            if (step > 0 && leftMinutes < maxLeftMinutes()) {
+                leftMinutes++;
+                ensureTotalAtLeastCycle();
+            }
+            if (step < 0 && leftMinutes > MIN_DIRECTION_MINUTES) {
+                leftMinutes--;
+            }
+            drawEdit("LEFT", leftMinutes, MIN_DIRECTION_MINUTES, maxLeftMinutes());
             break;
 
-        case UiState::EDIT_TOTAL:
-            if (step > 0 && totalMinutes < 120) totalMinutes++;
-            if (step < 0 && totalMinutes > 1) totalMinutes--;
-            drawEdit("TOTAL", totalMinutes, 120);
+        case UiState::EDIT_TOTAL: {
+            const uint16_t minTotal = cycleMinutes();
+            if (step > 0 && totalMinutes < MAX_TOTAL_MINUTES) totalMinutes++;
+            if (step < 0 && totalMinutes > minTotal) totalMinutes--;
+            drawEdit("TOTAL", totalMinutes, cycleMinutes(), MAX_TOTAL_MINUTES);
             break;
+        }
 
         default:
             break;
@@ -400,13 +452,13 @@ void handleEncoderPush() {
         case UiState::MENU:
             if (menuIndex == 0) {
                 uiState = UiState::EDIT_RIGHT;
-                drawEdit("RIGHT", rightMinutes, 3);
+                drawEdit("RIGHT", rightMinutes, MIN_DIRECTION_MINUTES, maxRightMinutes());
             } else if (menuIndex == 1) {
                 uiState = UiState::EDIT_LEFT;
-                drawEdit("LEFT", leftMinutes, 3);
+                drawEdit("LEFT", leftMinutes, MIN_DIRECTION_MINUTES, maxLeftMinutes());
             } else if (menuIndex == 2) {
                 uiState = UiState::EDIT_TOTAL;
-                drawEdit("TOTAL", totalMinutes, 120);
+                drawEdit("TOTAL", totalMinutes, cycleMinutes(), MAX_TOTAL_MINUTES);
             } else {
                 startRun();
             }
@@ -431,8 +483,6 @@ void handleEncoderPush() {
     }
 }
 
-// HalfQuad у EC11 обычно даёт 2 аппаратных отсчёта на один фиксированный щелчок.
-// Делим на 2 и работаем уже с логической позицией меню.
 int64_t lastEncoderPosition = 0;
 
 void updateEncoder() {
@@ -443,7 +493,6 @@ void updateEncoder() {
         lastEncoderPosition++;
         handleEncoderTurn(+1);
     }
-
     while (lastEncoderPosition > position) {
         lastEncoderPosition--;
         handleEncoderTurn(-1);
@@ -463,7 +512,6 @@ void setup() {
     btnBack.begin();
     btnConfirm.begin();
 
-    // Аппаратный счётчик импульсов ESP32 (PCNT).
     ESP32Encoder::useInternalWeakPullResistors = puType::up;
     encoder.attachHalfQuad(PIN_ENC_A, PIN_ENC_B);
     encoder.clearCount();
@@ -477,8 +525,8 @@ void setup() {
     loadSettings();
     drawMenu();
 
-    Serial.printf("ESP32Encoder started: TRA=%u TRB=%u PUSH=%u\n",
-                  PIN_ENC_A, PIN_ENC_B, PIN_ENC_PUSH);
+    Serial.printf("Settings RIGHT=%u LEFT=%u TOTAL=%u MIN_TOTAL=%u\n",
+                  rightMinutes, leftMinutes, totalMinutes, cycleMinutes());
 }
 
 void loop() {
@@ -490,17 +538,9 @@ void loop() {
     btnBack.update(now);
     btnConfirm.update(now);
 
-    if (btnEncoder.pressed()) {
-        handleEncoderPush();
-    }
-
-    if (btnBack.pressed() && uiState == UiState::RUNNING) {
-        stopRun(false);
-    }
-
-    if (btnConfirm.pressed() && uiState != UiState::RUNNING) {
-        startRun();
-    }
+    if (btnEncoder.pressed()) handleEncoderPush();
+    if (btnBack.pressed() && uiState == UiState::RUNNING) stopRun(false);
+    if (btnConfirm.pressed() && uiState != UiState::RUNNING) startRun();
 
     updateRun(now);
 }
